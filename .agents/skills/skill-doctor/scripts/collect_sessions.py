@@ -176,6 +176,39 @@ def resolve_repos(repo_args):
     return repos
 
 
+def add_skill(skills, skill_md: Path):
+    """Record one skill. The first path recorded for a name wins."""
+    name = skill_md.parent.name
+    if not name or name.startswith(".") or name in skills:
+        return
+    try:
+        text = skill_md.read_text(errors="replace")
+        stat = skill_md.stat()
+    except OSError:
+        return
+    desc = ""
+    match = re.search(r"^description:\s*(.+)$", text, re.MULTILINE)
+    if match:
+        desc = match.group(1).strip().strip("\"'")[:300]
+    skills[name] = {
+        "name": name,
+        "path": str(skill_md),
+        "description": desc,
+        "bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+def cursor_plugin_skill_files(cursor_home: Path):
+    """Newest plugin copy of each skill name comes first."""
+    plugins = Path(cursor_home) / "plugins"
+    if not plugins.is_dir():
+        return []
+    files = [path for path in plugins.glob("**/skills/*/SKILL.md") if path.is_file()]
+    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return files
+
+
 def discover_skills(repos, codex_home: Path, cursor_home, extra_dirs, include_global: bool,
                     pi_home: Path = None, grok_home: Path = None, zcode_home: Path = None,
                     hermes_home: Path = None):
@@ -185,6 +218,7 @@ def discover_skills(repos, codex_home: Path, cursor_home, extra_dirs, include_gl
     for repo in repos:
         roots.extend((
             repo / ".agents" / "skills",
+            repo / ".cursor" / "skills",
             repo / ".claude" / "skills",
             repo / ".codex" / "skills",
         ))
@@ -196,6 +230,7 @@ def discover_skills(repos, codex_home: Path, cursor_home, extra_dirs, include_gl
         ]
         if cursor_home is not None:
             roots.append(Path(cursor_home) / "skills")
+            roots.append(Path(cursor_home) / "skills-cursor")
         for home in (pi_home, grok_home, zcode_home, hermes_home):
             if home is not None:
                 roots.append(Path(home) / "skills")
@@ -206,24 +241,10 @@ def discover_skills(repos, codex_home: Path, cursor_home, extra_dirs, include_gl
         if not root.is_dir():
             continue
         for skill_md in sorted(root.glob("*/SKILL.md")):
-            name = skill_md.parent.name
-            if name in skills:
-                continue
-            try:
-                text = skill_md.read_text(errors="replace")
-            except OSError:
-                continue
-            desc = ""
-            m = re.search(r"^description:\s*(.+)$", text, re.MULTILINE)
-            if m:
-                desc = m.group(1).strip().strip("\"'")[:300]
-            skills[name] = {
-                "name": name,
-                "path": str(skill_md),
-                "description": desc,
-                "bytes": skill_md.stat().st_size,
-                "modified_at": datetime.fromtimestamp(skill_md.stat().st_mtime, tz=timezone.utc).isoformat(),
-            }
+            add_skill(skills, skill_md)
+    if include_global and cursor_home is not None:
+        for skill_md in cursor_plugin_skill_files(cursor_home):
+            add_skill(skills, skill_md)
     return skills
 
 
