@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Collect local Claude Code, Codex, Warp, Pi, Grok Build, and ZCode sessions and skills for scoring.
+"""Collect local Claude Code, Codex, Cursor, Warp, Pi, Grok Build, and ZCode sessions and skills for scoring.
 
-Scans Claude Code project history, Codex rollout files, Warp's local
+Scans Claude Code project history, Codex rollout files, Cursor Agent
+transcripts, Warp's local
 conversation databases, Pi agent session JSONL, Grok Build chat history,
 and/or ZCode model-io rollouts, discovers installed skills, detects which
 sessions used which skills, and emits:
@@ -22,6 +23,7 @@ import subprocess
 import sys
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
 from warp_decoder import ProtobufDecodeError, decode_task
@@ -36,15 +38,55 @@ TRANSCRIPT_TAIL = 40
 CODE_EDIT_HINTS = ("apply_patch", "*** Begin Patch", "edit_file", "create_file", "str_replace", "write_file")
 CLAUDE_CODE_EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit", "Write"}
 GENERIC_EDIT_TOOLS = {"edit", "write", "apply_patch", "edit_file", "write_file", "str_replace", "search_replace"}
+CURSOR_EDIT_TOOLS = {"ApplyPatch", "EditNotebook"}
+CURSOR_QUERY_RE = re.compile(
+    r"<user_query>\s*(.*?)\s*</user_query>",
+    re.DOTALL,
+)
+CURSOR_TIMESTAMP_RE = re.compile(
+    r"<timestamp>[^,]+,\s+"
+    r"([A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2} [AP]M) "
+    r"\(UTC([+-]\d{1,2})(?::(\d{2}))?\)</timestamp>"
+)
+CURSOR_ATTACHED_SKILL_RE = re.compile(
+    r"^Skill Name:\s*([^\n]+)$",
+    re.MULTILINE,
+)
+CURSOR_ATTACHED_SKILLS_BLOCK_RE = re.compile(
+    r"<manually_attached_skills>\s*(.*?)\s*</manually_attached_skills>",
+    re.DOTALL,
+)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--harness",
-        choices=("auto", "all", "claude", "codex", "warp", "pi", "grok", "zcode", "hermes"),
+        choices=(
+            "auto",
+            "all",
+            "claude",
+            "codex",
+            "cursor",
+            "warp",
+            "pi",
+            "grok",
+            "zcode",
+            "hermes",
+        ),
         default="auto",
         help="session source (default: auto; scans every locally available source)",
+    )
+    p.add_argument(
+        "--cursor-home",
+        default=os.environ.get("CURSOR_HOME", "~/.cursor"),
+        help="Cursor home directory (default: CURSOR_HOME or ~/.cursor)",
+    )
+    p.add_argument(
+        "--cursor-transcript",
+        action="append",
+        default=[],
+        help="explicit Cursor transcript JSONL path (repeatable)",
     )
     p.add_argument(
         "--claude-home",
@@ -95,7 +137,7 @@ def parse_args():
         help="score conversations from every project represented in local history",
     )
     p.add_argument("--include-global-skills", action="store_true",
-                   help="also discover skills outside the repo (~/.codex/skills, ~/.agents/skills, ~/.claude/skills, ~/.pi/agent/skills, ~/.grok/skills, ~/.zcode/skills, Hermes home/skills)")
+                   help="also discover skills outside the repo (~/.codex/skills, ~/.cursor/skills, ~/.agents/skills, ~/.claude/skills, ~/.pi/agent/skills, ~/.grok/skills, ~/.zcode/skills, Hermes home/skills)")
     p.add_argument("--days", type=int, default=45, help="only consider sessions modified in the last N days")
     p.add_argument("--max-sessions", type=int, default=12, help="max sessions to sample for scoring")
     p.add_argument("--per-skill", type=int, default=3, help="max sampled sessions per skill")
@@ -134,7 +176,7 @@ def resolve_repos(repo_args):
     return repos
 
 
-def discover_skills(repos, codex_home: Path, extra_dirs, include_global: bool,
+def discover_skills(repos, codex_home: Path, cursor_home, extra_dirs, include_global: bool,
                     pi_home: Path = None, grok_home: Path = None, zcode_home: Path = None,
                     hermes_home: Path = None):
     if isinstance(repos, Path):
@@ -152,6 +194,8 @@ def discover_skills(repos, codex_home: Path, extra_dirs, include_global: bool,
             Path.home() / ".agents" / "skills",
             Path.home() / ".claude" / "skills",
         ]
+        if cursor_home is not None:
+            roots.append(Path(cursor_home) / "skills")
         for home in (pi_home, grok_home, zcode_home, hermes_home):
             if home is not None:
                 roots.append(Path(home) / "skills")
@@ -244,6 +288,143 @@ def extract_text(content) -> str:
     return "\n".join(parts)
 
 
+def detect_skill_candidates(text: str):
+    """Extract possible installed-skill names from one tool argument payload."""
+    normalized = text.replace("\\", "/")
+    candidates = set(re.findall(r"(?:^|/)skills/+([^/]+)/+", normalized))
+    candidates.update(re.findall(
+        r'"(?:skill|name|bundled_skill_id)"\s*:\s*"([^"]+)"',
+        normalized,
+    ))
+    return candidates
+
+
+def parse_cursor_prompt_timestamp(text):
+    match = CURSOR_TIMESTAMP_RE.search(text)
+    if not match:
+        return None
+    local_time, hour_text, minute_text = match.groups()
+    offset_hours = int(hour_text)
+    offset_minutes = int(minute_text or "0")
+    if offset_hours < 0:
+        offset_minutes = -offset_minutes
+    tz = timezone(timedelta(hours=offset_hours, minutes=offset_minutes))
+    try:
+        parsed = datetime.strptime(
+            local_time,
+            "%b %d, %Y, %I:%M %p",
+        )
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=tz).isoformat()
+
+
+def extract_cursor_user_payload(text):
+    attached_skills = set()
+    for block in CURSOR_ATTACHED_SKILLS_BLOCK_RE.findall(text):
+        attached_skills.update(
+            name.strip()
+            for name in CURSOR_ATTACHED_SKILL_RE.findall(block)
+            if name.strip()
+        )
+        attached_skills.update(detect_skill_candidates(block))
+    timestamp = parse_cursor_prompt_timestamp(text)
+    query = CURSOR_QUERY_RE.search(text)
+    if query:
+        return query.group(1).strip(), timestamp, attached_skills
+    if looks_injected(text):
+        return "", timestamp, attached_skills
+    return text.strip(), timestamp, attached_skills
+
+
+def cursor_cwd_candidates_from_tool_input(value):
+    if not isinstance(value, dict):
+        return [], []
+    working_directories = []
+    path_directories = []
+    for key in ("working_directory", "cwd", "target_directory"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and os.path.isabs(candidate):
+            working_directories.append(candidate)
+    for key in ("path", "file_path"):
+        candidate = value.get(key)
+        if not isinstance(candidate, str) or not os.path.isabs(candidate):
+            continue
+        path = Path(candidate)
+        path_directories.append(str(path if path.is_dir() else path.parent))
+    nested = value.get("arguments")
+    if isinstance(nested, dict):
+        nested_working, nested_paths = cursor_cwd_candidates_from_tool_input(
+            nested
+        )
+        working_directories.extend(nested_working)
+        path_directories.extend(nested_paths)
+    return working_directories, path_directories
+
+
+def normalize_cursor_candidate(value):
+    try:
+        return str(Path(value).expanduser().resolve())
+    except OSError:
+        return str(Path(value).expanduser())
+
+
+@lru_cache(maxsize=None)
+def _git_root_for_normalized_directory(normalized_directory):
+    path = Path(normalized_directory)
+    if not path.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return str(Path(result.stdout.strip()).resolve())
+
+
+def git_root_for_directory(value):
+    return _git_root_for_normalized_directory(
+        normalize_cursor_candidate(value)
+    )
+
+
+git_root_for_directory.cache_clear = (
+    _git_root_for_normalized_directory.cache_clear
+)
+git_root_for_directory.cache_info = (
+    _git_root_for_normalized_directory.cache_info
+)
+
+
+def unique_cursor_candidates(*groups):
+    candidates = []
+    seen = set()
+    for group in groups:
+        for value in group:
+            normalized = normalize_cursor_candidate(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append(normalized)
+    return candidates
+
+
+def select_cursor_cwd(workspace_hint, working_directories, path_directories):
+    if workspace_hint:
+        return str(Path(workspace_hint).expanduser().resolve())
+    if working_directories:
+        return working_directories[0]
+    if path_directories:
+        return path_directories[0]
+    return None
+
+
 def iter_jsonl_records(path: Path):
     """Yield every valid JSON object without loading the whole file."""
     stream = path.open("r", encoding="utf-8", errors="replace")
@@ -286,15 +467,124 @@ class TranscriptBuffer:
         ] + list(self._tail)
 
 
-def detect_skill_candidates(text: str):
-    """Extract possible installed-skill names from one tool argument payload."""
-    normalized = text.replace("\\", "/")
-    candidates = set(re.findall(r"(?:^|/)skills/+([^/]+)/+", normalized))
-    candidates.update(re.findall(
-        r'"(?:skill|name|bundled_skill_id)"\s*:\s*"([^"]+)"',
-        normalized,
-    ))
-    return candidates
+def cursor_project_key(path: Path) -> str:
+    """Best-effort encoding observed in Cursor's local project directory."""
+    text = str(path.expanduser().resolve())
+    return re.sub(r"[^A-Za-z0-9]", "-", text).lstrip("-")
+
+
+def find_cursor_session_files(
+    cursor_home: Path,
+    cutoff: datetime,
+    include_subagents: bool,
+    explicit_paths,
+    return_explicit_counts=False,
+):
+    candidates = []
+    root = cursor_home / "projects"
+    if root.is_dir():
+        candidates.extend(
+            root.glob("*/agent-transcripts/*/*.jsonl")
+        )
+        if include_subagents:
+            candidates.extend(
+                root.glob(
+                    "*/agent-transcripts/*/subagents/*.jsonl"
+                )
+            )
+
+    files = []
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            modified = datetime.fromtimestamp(
+                resolved.stat().st_mtime,
+                tz=timezone.utc,
+            )
+        except OSError:
+            continue
+        if resolved in seen or modified < cutoff:
+            continue
+        if resolved.parent.name == "subagents" and not include_subagents:
+            continue
+        seen.add(resolved)
+        files.append((modified, path))
+
+    explicit_seen = set()
+    explicit_accepted = 0
+    for value in explicit_paths:
+        path = Path(value).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError as exc:
+            print(
+                f"warning: rejected explicit Cursor transcript {path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if resolved in explicit_seen:
+            print(
+                f"warning: rejected explicit Cursor transcript {path}: "
+                "duplicate path",
+                file=sys.stderr,
+            )
+            continue
+        explicit_seen.add(resolved)
+        try:
+            modified = datetime.fromtimestamp(
+                resolved.stat().st_mtime,
+                tz=timezone.utc,
+            )
+            with resolved.open("r", encoding="utf-8", errors="replace"):
+                pass
+        except OSError as exc:
+            print(
+                f"warning: rejected explicit Cursor transcript {path}: "
+                f"not readable ({exc})",
+                file=sys.stderr,
+            )
+            continue
+        if modified < cutoff:
+            print(
+                f"warning: rejected explicit Cursor transcript {path}: "
+                "older than cutoff",
+                file=sys.stderr,
+            )
+            continue
+        if resolved.parent.name == "subagents" and not include_subagents:
+            print(
+                f"warning: rejected explicit Cursor transcript {path}: "
+                "subagents are excluded",
+                file=sys.stderr,
+            )
+            continue
+        explicit_accepted += 1
+        if resolved not in seen:
+            seen.add(resolved)
+            files.append((modified, resolved))
+    files.sort(key=lambda item: item[0], reverse=True)
+    if return_explicit_counts:
+        return files, {
+            "requested": len(explicit_paths),
+            "accepted": explicit_accepted,
+        }
+    return files
+
+
+def cursor_workspace_hint(path: Path, repos, cursor_home: Path):
+    projects_root = cursor_home / "projects"
+    try:
+        project_name = path.resolve().relative_to(
+            projects_root.resolve()
+        ).parts[0]
+    except (OSError, ValueError, IndexError):
+        return None
+    for repo in repos:
+        resolved = repo.expanduser().resolve()
+        if project_name == cursor_project_key(resolved):
+            return resolved
+    return None
 
 
 def parse_claude_session(path: Path, skill_names, include_subagents: bool):
@@ -429,6 +719,173 @@ def parse_claude_session(path: Path, skill_names, include_subagents: bool):
         or has_code_edit_hint
     )
     return meta, stats, entries.finish(), sorted(skills_used)
+
+
+def parse_cursor_session(
+    path: Path,
+    skill_names,
+    include_subagents: bool,
+    workspace_hint=None,
+):
+    """Normalize one Cursor Agent JSONL transcript."""
+    is_subagent = path.parent.name == "subagents"
+    if is_subagent and not include_subagents:
+        return None
+    try:
+        records = iter_jsonl_records(path)
+        modified_at = datetime.fromtimestamp(
+            path.stat().st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
+    except OSError:
+        return None
+
+    meta = {
+        "id": path.stem,
+        "cwd": str(workspace_hint) if workspace_hint else None,
+        "started_at": None,
+        "originator": "cursor",
+        "thread_source": "subagent" if is_subagent else None,
+    }
+    stats = {
+        "user_turns": 0,
+        "assistant_turns": 0,
+        "tool_calls": 0,
+        "repeated_tool_calls": 0,
+        "error_outputs": 0,
+    }
+    entries = TranscriptBuffer()
+    seen_calls = {}
+    skills_used = set()
+    used_tool_names = set()
+    working_directories = []
+    path_directories = []
+    has_code_edit_hint = False
+    first_ts = last_ts = None
+
+    for obj in records:
+        if not isinstance(obj, dict):
+            continue
+        message = obj.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        role = obj.get("role") or message.get("role")
+        record_ts = obj.get("timestamp") or message.get("timestamp")
+        if isinstance(record_ts, str):
+            first_ts = first_ts or record_ts
+            last_ts = record_ts
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [
+            {"type": "text", "text": content}
+        ]
+        has_user_text = False
+        has_assistant_content = False
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if not isinstance(text, str) or not text:
+                    continue
+                if role == "user":
+                    visible, prompt_ts, attached = extract_cursor_user_payload(
+                        text
+                    )
+                    skills_used.update(attached)
+                    if prompt_ts:
+                        first_ts = first_ts or prompt_ts
+                        last_ts = prompt_ts
+                    if visible:
+                        has_user_text = True
+                        entries.append((
+                            "user",
+                            truncate(visible, MAX_MSG_CHARS),
+                        ))
+                elif role == "assistant" and not looks_injected(text):
+                    has_assistant_content = True
+                    entries.append((
+                        "assistant",
+                        truncate(text, MAX_MSG_CHARS),
+                    ))
+            elif block_type == "tool_use":
+                has_assistant_content = True
+                stats["tool_calls"] += 1
+                name = str(block.get("name") or "unknown")
+                args = block.get("input") or {}
+                args_text = (
+                    args
+                    if isinstance(args, str)
+                    else json.dumps(args, ensure_ascii=False, sort_keys=True)
+                )
+                key = hashlib.sha1((name + args_text).encode()).hexdigest()
+                seen_calls[key] = seen_calls.get(key, 0) + 1
+                if seen_calls[key] > 1:
+                    stats["repeated_tool_calls"] += 1
+                used_tool_names.add(name)
+                skills_used.update(detect_skill_candidates(args_text))
+                has_code_edit_hint = has_code_edit_hint or any(
+                    hint in args_text for hint in CODE_EDIT_HINTS
+                )
+                working, paths = cursor_cwd_candidates_from_tool_input(args)
+                working_directories.extend(working)
+                path_directories.extend(paths)
+                entries.append((
+                    f"tool:{name}",
+                    truncate(args_text, MAX_TOOL_CHARS),
+                ))
+            elif block_type == "tool_result" or role in (
+                "tool",
+                "toolResult",
+            ):
+                result = extract_text(
+                    block.get("content") or block.get("text")
+                )
+                if not result:
+                    continue
+                low = result[:2000].lower()
+                if (
+                    block.get("is_error")
+                    or block.get("isError")
+                    or "error" in low
+                    or "failed" in low
+                    or "traceback" in low
+                ):
+                    stats["error_outputs"] += 1
+                entries.append((
+                    "output",
+                    truncate(result, MAX_TOOL_CHARS),
+                ))
+
+        if role == "user" and has_user_text:
+            stats["user_turns"] += 1
+        elif role == "assistant" and has_assistant_content:
+            stats["assistant_turns"] += 1
+
+    stats["first_ts"] = first_ts or modified_at
+    stats["last_ts"] = last_ts or modified_at
+    stats["has_code_edits"] = (
+        bool(used_tool_names & CURSOR_EDIT_TOOLS)
+        or bool(used_tool_names & GENERIC_EDIT_TOOLS)
+        or has_code_edit_hint
+    )
+    meta["_cwd_candidates"] = unique_cursor_candidates(
+        working_directories,
+        path_directories,
+    )
+    meta["cwd"] = select_cursor_cwd(
+        workspace_hint,
+        working_directories,
+        path_directories,
+    )
+    meta["started_at"] = stats["first_ts"]
+    return (
+        meta,
+        stats,
+        entries.finish(),
+        sorted(skills_used),
+    )
 
 
 def looks_injected(text: str) -> bool:
@@ -1487,32 +1944,45 @@ def session_matches_repos(cwd, repos) -> bool:
     return any(session_matches_repo(cwd, repo) for repo in repos)
 
 
+def session_meta_matches_repos(meta, repos) -> bool:
+    candidates = [meta.get("cwd")]
+    candidates.extend(meta.get("_cwd_candidates") or [])
+    return any(session_matches_repos(candidate, repos) for candidate in candidates)
+
+
+def matching_repo_for_session_meta(meta, repos):
+    candidates = [meta.get("cwd")]
+    candidates.extend(meta.get("_cwd_candidates") or [])
+    for candidate in candidates:
+        for repo in repos:
+            if session_matches_repo(candidate, repo):
+                return repo.resolve()
+    return None
+
+
 def infer_session_repos(sessions):
     repos = []
     seen = set()
     for session in sessions:
-        cwd = session["meta"].get("cwd")
-        if not cwd:
-            continue
-        path = Path(cwd).expanduser()
-        if not path.is_dir():
-            continue
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        if result.returncode != 0 or not result.stdout.strip():
-            continue
-        repo = Path(result.stdout.strip()).resolve()
-        if repo in seen:
-            continue
-        seen.add(repo)
-        repos.append(repo)
+        meta = session["meta"]
+        has_cursor_candidates = "_cwd_candidates" in meta
+        candidates = [meta.get("cwd")]
+        candidates.extend(meta.get("_cwd_candidates") or [])
+        session_root = None
+        for cwd in candidates:
+            if not cwd:
+                continue
+            root = git_root_for_directory(cwd)
+            if not root:
+                continue
+            session_root = session_root or root
+            repo = Path(root)
+            if repo in seen:
+                continue
+            seen.add(repo)
+            repos.append(repo)
+        if session_root and has_cursor_candidates:
+            meta["cwd"] = session_root
     return repos
 
 
@@ -1546,6 +2016,7 @@ def main():
         sys.exit(2)
     claude_home = Path(args.claude_home).expanduser()
     codex_home = Path(args.codex_home).expanduser()
+    cursor_home = Path(args.cursor_home).expanduser()
     pi_home = Path(args.pi_home).expanduser()
     grok_home = Path(args.grok_home).expanduser()
     zcode_home = Path(args.zcode_home).expanduser()
@@ -1558,6 +2029,7 @@ def main():
     skills = discover_skills(
         repos,
         codex_home,
+        cursor_home,
         args.skills_dir,
         args.include_global_skills,
         pi_home=pi_home,
@@ -1643,6 +2115,69 @@ def main():
     elif args.harness == "codex":
         print(f"error: Codex home not found at {codex_home}", file=sys.stderr)
         sys.exit(1)
+
+    requested_cursor = args.harness in ("auto", "all", "cursor")
+    cursor_files = []
+    if requested_cursor:
+        cursor_files, explicit_counts = find_cursor_session_files(
+            cursor_home,
+            cutoff,
+            args.include_subagents,
+            args.cursor_transcript,
+            return_explicit_counts=True,
+        )
+        cursor_source_exists = (
+            (cursor_home / "projects").is_dir()
+            or bool(args.cursor_transcript)
+        )
+        if cursor_source_exists:
+            sources["cursor"] = {
+                "home": str(cursor_home),
+                "records_in_window": len(cursor_files),
+                "explicit_transcripts_requested": explicit_counts["requested"],
+                "explicit_transcripts_accepted": explicit_counts["accepted"],
+            }
+            scanned_count += len(cursor_files)
+            for mtime, path in cursor_files:
+                workspace_hint = cursor_workspace_hint(
+                    path,
+                    repos,
+                    cursor_home,
+                )
+                parsed = parse_cursor_session(
+                    path,
+                    skills.keys(),
+                    args.include_subagents,
+                    workspace_hint=workspace_hint,
+                )
+                if parsed is None:
+                    continue
+                meta, stats, entries, skills_used = parsed
+                if not args.all_conversations:
+                    matched_repo = matching_repo_for_session_meta(meta, repos)
+                    if matched_repo is None:
+                        continue
+                    meta["cwd"] = str(matched_repo)
+                in_scope_count += 1
+                if stats["assistant_turns"] < 1 or stats["tool_calls"] < 1:
+                    continue
+                sessions.append({
+                    "harness": "cursor",
+                    "meta": meta,
+                    "stats": stats,
+                    "skills_used": skills_used,
+                    "file": str(path),
+                    "modified_at": mtime.isoformat(),
+                    "_entries": entries,
+                })
+        elif args.harness == "cursor":
+            print(
+                "error: no Cursor Agent transcripts found under "
+                f"{cursor_home / 'projects'} and no readable "
+                "--cursor-transcript was supplied",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     requested_warp = args.harness in ("auto", "all", "warp")
     warp_databases = []
@@ -1824,7 +2359,7 @@ def main():
 
     if not sources:
         print(
-            "error: no supported session source found (Claude Code, Codex, Warp, Pi, Grok, ZCode, or Hermes)",
+            "error: no supported session source found (Claude Code, Codex, Cursor, Warp, Pi, Grok, ZCode, or Hermes)",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1833,6 +2368,7 @@ def main():
         skills = discover_skills(
             repos,
             codex_home,
+            cursor_home,
             args.skills_dir,
             args.include_global_skills,
             pi_home=pi_home,
@@ -1840,6 +2376,8 @@ def main():
             zcode_home=zcode_home,
             hermes_home=hermes_home,
         )
+    for session in sessions:
+        session["meta"].pop("_cwd_candidates", None)
     installed_skill_names = set(skills)
     for session in sessions:
         detected = detect_skills_from_entries(
@@ -1904,6 +2442,7 @@ def main():
         "sources": sources,
         "claude_home": str(claude_home) if "claude" in sources else None,
         "codex_home": str(codex_home) if "codex" in sources else None,
+        "cursor_home": str(cursor_home) if "cursor" in sources else None,
         "pi_home": str(pi_home) if "pi" in sources else None,
         "grok_home": str(grok_home) if "grok" in sources else None,
         "zcode_home": str(zcode_home) if "zcode" in sources else None,
