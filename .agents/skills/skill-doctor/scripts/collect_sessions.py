@@ -423,6 +423,56 @@ git_root_for_directory.cache_info = (
 )
 
 
+def _git_common_dir_from_entry(directory: Path, git_entry: Path):
+    """Directory shared by a checkout and its linked worktrees, from a .git entry."""
+    if git_entry.is_dir():
+        return str(git_entry.resolve())
+    try:
+        text = git_entry.read_text(errors="replace")
+    except OSError:
+        return None
+    gitdir = None
+    for line in text.splitlines():
+        if line.startswith("gitdir:"):
+            gitdir = Path(line.split(":", 1)[1].strip())
+            break
+    if gitdir is None:
+        return None
+    if not gitdir.is_absolute():
+        gitdir = (directory / gitdir).resolve()
+    else:
+        gitdir = gitdir.resolve()
+    if "worktrees" in gitdir.parts:
+        return str(Path(*gitdir.parts[:gitdir.parts.index("worktrees")]))
+    return str(gitdir)
+
+
+@lru_cache(maxsize=None)
+def _git_common_dir_cached(normalized):
+    path = Path(normalized)
+    if path.is_file():
+        path = path.parent
+    for directory in [path, *path.parents]:
+        git_entry = directory / ".git"
+        if git_entry.exists():
+            return _git_common_dir_from_entry(directory, git_entry)
+    return None
+
+
+def git_common_dir(value):
+    """Git directory shared by this path and any linked worktree of the same repo.
+
+    Reads the .git entry directly. Callers that reject a path must not spawn git.
+    """
+    if not value:
+        return None
+    try:
+        normalized = str(Path(value).expanduser().resolve())
+    except OSError:
+        normalized = str(Path(value).expanduser())
+    return _git_common_dir_cached(normalized)
+
+
 def unique_cursor_candidates(*groups):
     candidates = []
     seen = set()
@@ -1960,11 +2010,13 @@ def render_transcript(meta, stats, skills_used, entries) -> str:
 def session_matches_repo(cwd, repo: Path) -> bool:
     """True when a session's recorded cwd belongs to this repo.
 
-    Two ways to match:
+    Three ways to match:
     1. cwd is inside the repo root (same-machine sessions).
     2. cwd's trailing directory name equals the repo's name (git/Codex
        worktrees like ~/.codex/worktrees/<id>/<repo-name>, and sessions
        imported from another machine where the checkout path differs).
+    3. cwd and repo are linked worktrees of one repository. Their directory
+       names differ, so basename matching misses them.
     Basename matching can over-match if two different projects share a
     directory name; acceptable for a report, and prefix matching alone
     misses every worktree session.
@@ -1977,7 +2029,11 @@ def session_matches_repo(cwd, repo: Path) -> bool:
             return True
     except OSError:
         pass  # cwd from another machine may not exist locally
-    return p.name == repo.name or repo.name in p.parts
+    if p.name == repo.name or repo.name in p.parts:
+        return True
+    cwd_common = git_common_dir(p)
+    repo_common = git_common_dir(repo)
+    return bool(cwd_common and cwd_common == repo_common)
 
 
 def session_matches_repos(cwd, repos) -> bool:
