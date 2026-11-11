@@ -396,6 +396,40 @@ class CursorSessionTests(unittest.TestCase):
             self.assertFalse(in_scope)
             run.assert_not_called()
 
+    def test_linked_worktree_matches_sessions_from_the_main_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main = root / "main-repo"
+            main.mkdir()
+            subprocess.run(["git", "init", "-q", str(main)], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(main),
+                    "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test",
+                    "commit", "--allow-empty", "-m", "init", "-q",
+                ],
+                check=True,
+            )
+            worktree = root / "feature-worktree"
+            sibling = root / "sibling-worktree"
+            subprocess.run(
+                ["git", "-C", str(main), "worktree", "add", "--detach", "-q", str(worktree), "HEAD"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(main), "worktree", "add", "--detach", "-q", str(sibling), "HEAD"],
+                check=True,
+            )
+            other = root / "other-repo"
+            other.mkdir()
+            subprocess.run(["git", "init", "-q", str(other)], check=True)
+
+            self.assertTrue(session_matches_repos(main, [worktree]))
+            self.assertTrue(session_matches_repos(worktree, [main]))
+            self.assertTrue(session_matches_repos(sibling, [worktree]))
+            self.assertFalse(session_matches_repos(other, [worktree]))
+
     def test_parses_wrapped_query_tools_attached_skills_and_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-1.jsonl"
