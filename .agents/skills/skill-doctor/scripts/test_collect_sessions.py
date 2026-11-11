@@ -503,6 +503,26 @@ class CursorSessionTests(unittest.TestCase):
             self.assertIn(("output", "command failed"), entries)
             self.assertEqual(skills, [])
 
+    def test_counts_turn_level_error_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-error.jsonl"
+            write_jsonl(path, [
+                {
+                    "role": "user",
+                    "message": {"content": [{"type": "text", "text": "Continue"}]},
+                },
+                {
+                    "type": "turn-ended",
+                    "status": "error",
+                    "error": "model request failed",
+                },
+            ])
+
+            _, stats, entries, _ = parse_cursor_session(path, set(), False)
+
+            self.assertEqual(stats["error_outputs"], 1)
+            self.assertIn(("output", "model request failed"), entries)
+
     def test_ignores_malformed_lines_unknown_blocks_and_injected_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session-3.jsonl"
