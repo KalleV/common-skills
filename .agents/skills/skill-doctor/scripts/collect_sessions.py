@@ -787,6 +787,12 @@ def parse_cursor_session(
     for obj in records:
         if not isinstance(obj, dict):
             continue
+        # Cursor persists a turn-level error on its own record. Tool stdout
+        # and stderr are not stored, so this is the only failure signal.
+        error_text = obj.get("error")
+        if isinstance(error_text, str) and error_text.strip():
+            stats["error_outputs"] += 1
+            entries.append(("output", truncate(error_text.strip(), MAX_TOOL_CHARS)))
         message = obj.get("message") or {}
         if not isinstance(message, dict):
             continue

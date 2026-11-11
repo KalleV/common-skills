@@ -29,6 +29,8 @@ Assess:
 - **Flailing.** Retrying a failing approach unchanged, or guessing when reading the code or docs would have settled it. An abandoned path only counts against the agent when the information to avoid it was already available.
 - **Verification timing.** Checks run once, early enough to catch a defect before declaring done, not deferred until after or re-run redundantly.
 
+Cursor transcripts store tool calls and turn-level error records. They omit tool results, so a transcript with no output entries leaves command success unknown. Count a failure only when an output entry shows it. Do not treat a missing output as a clean run.
+
 **Reason**
 
 One to three sentences naming the dominant source of waste with a rough count (three fix-test cycles, four redundant reads, two repeated user corrections), and the likely fixable cause — a missing or weak skill, an ambiguous instruction, a late check. When a skill exists that should have prevented the waste, name the skill.
