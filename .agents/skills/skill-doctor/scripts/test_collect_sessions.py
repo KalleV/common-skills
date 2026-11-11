@@ -140,6 +140,52 @@ class ClaudeSessionTests(unittest.TestCase):
                 }.issubset(skills)
             )
 
+    def test_discovers_cursor_project_managed_and_newest_plugin_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            project = repo / ".cursor" / "skills" / "project-only" / "SKILL.md"
+            shared = repo / ".cursor" / "skills" / "shared" / "SKILL.md"
+            managed = root / "cursor-home" / "skills-cursor" / "managed" / "SKILL.md"
+            older = (
+                root / "cursor-home" / "plugins" / "cache" / "old"
+                / "skills" / "plugin-skill" / "SKILL.md"
+            )
+            newer = (
+                root / "cursor-home" / "plugins" / "cache" / "new"
+                / "skills" / "plugin-skill" / "SKILL.md"
+            )
+            plugin_shared = (
+                root / "cursor-home" / "plugins" / "cache" / "new"
+                / "skills" / "shared" / "SKILL.md"
+            )
+            for path, description in (
+                (project, "Project"),
+                (shared, "Project copy"),
+                (managed, "Managed"),
+                (older, "Old plugin"),
+                (newer, "New plugin"),
+                (plugin_shared, "Plugin copy"),
+            ):
+                path.parent.mkdir(parents=True)
+                path.write_text(f"---\ndescription: {description}\n---\n")
+            os.utime(older, (1, 1_000))
+            os.utime(newer, (1, 2_000))
+
+            skills = discover_skills(
+                [repo],
+                root / "codex-home",
+                root / "cursor-home",
+                [],
+                True,
+            )
+
+            self.assertEqual(skills["project-only"]["description"], "Project")
+            self.assertEqual(skills["managed"]["description"], "Managed")
+            self.assertEqual(skills["plugin-skill"]["description"], "New plugin")
+            self.assertEqual(skills["plugin-skill"]["path"], str(newer))
+            self.assertEqual(skills["shared"]["description"], "Project copy")
+
     def test_detects_skills_from_deferred_tool_entries(self):
         entries = [
             ("tool:Skill", '{"skill": "alpha"}'),

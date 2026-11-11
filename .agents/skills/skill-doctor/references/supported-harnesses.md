@@ -51,7 +51,8 @@ are preferred when a hook provides them.
 Project skills are discovered from:
 
 - `.agents/skills`
+- `.cursor/skills`
 - `.claude/skills`
 - `.codex/skills`
 
-Global skills are discovered from the corresponding directories under the user's home and configured harness homes when `--include-global-skills` is set: `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, `~/.cursor/skills`, Pi's skill directory under its agent home (default `~/.pi/agent/skills`), Grok Build's `~/.grok/skills`, and ZCode's `~/.zcode/skills`.
+Global skills are discovered from the corresponding directories under the user's home and configured harness homes when `--include-global-skills` is set: `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, `~/.cursor/skills`, `~/.cursor/skills-cursor`, and `~/.cursor/plugins/**/skills/*/SKILL.md`. Pi's skill directory is under its agent home (default `~/.pi/agent/skills`). Grok Build uses `~/.grok/skills`, and ZCode uses `~/.zcode/skills`. A project skill keeps its name when a global or plugin copy has the same name. When a plugin skill is installed more than once, the newest copy is kept.
